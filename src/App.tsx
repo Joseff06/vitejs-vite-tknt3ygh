@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, Fragment } from 'react';
 import {
   BarChart,
   Bar,
@@ -20,7 +20,8 @@ import {
   Calendar,
   Download,
   Share2,
-  Dot,
+  LineChart,
+  Trash2,
 } from 'lucide-react';
 
 // ─── DATA ────────────────────────────────────────────────────────────────────
@@ -928,6 +929,71 @@ const UEN_LIST = [
   'Construcción',
 ];
 
+// UEN piloto donde aplica el ICA y la Proyección 2027 (las que cubre el doc de la Dirección)
+const PILOTO = ['Oil & Gas', 'Geosintéticos', 'Alquiler de Equipos'];
+
+const MESES_CORTOS = [
+  'Ene',
+  'Feb',
+  'Mar',
+  'Abr',
+  'May',
+  'Jun',
+  'Jul',
+  'Ago',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dic',
+];
+
+// Estructura del Presupuesto Anual según el documento de la Dirección
+const PROYECCION_TEMPLATE: Record<
+  string,
+  { ingresos: string[]; costos: Record<string, string[]> }
+> = {
+  'Oil & Gas': {
+    ingresos: [
+      'Suministro para la prevención y control de derrames',
+      'Productos Absorbentes',
+    ],
+    costos: {
+      'Insumos y Materiales': [
+        'Suministro para la prevención y control de derrames',
+        'Productos Absorbentes',
+      ],
+      Diversos: ['Transportes'],
+    },
+  },
+  'Geosintéticos': {
+    ingresos: [
+      'Venta e instalación de geosintéticos',
+      'Otros servicios – Consultoría',
+      'Suministros',
+    ],
+    costos: {
+      'Insumos y Materiales': [
+        'Materias primas — Venta e instalación de geosintéticos',
+        'Materias primas — Consultoría',
+        'Suministros',
+      ],
+      Diversos: ['Transportes'],
+    },
+  },
+  'Alquiler de Equipos': {
+    ingresos: ['Contratos externos – servicios terceros'],
+    costos: {
+      Fijos: [
+        'Transporte de equipos / traslado',
+        'Renovación patente navegación',
+        'GPS',
+        'Parqueadero / bodegaje',
+      ],
+      Diversos: ['Transportes'],
+    },
+  },
+};
+
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 function estadoBadge(estado) {
@@ -956,9 +1022,115 @@ function projectStatus(avance) {
   return { label: 'Inicio', cls: 'bg-amber-50 text-amber-700' };
 }
 
+// Parsea "$58M", "+$8M", "-$6M", "—" → número en millones
+function parseM(s) {
+  if (!s || s === '—') return 0;
+  const cleaned = String(s).replace(/[$+M\s]/g, '').replace(',', '.');
+  const n = parseFloat(cleaned);
+  return isNaN(n) ? 0 : n;
+}
+
+// Formatea un número de millones → "$1,5M"
+function fmtM(n) {
+  return `$${Math.abs(n).toFixed(1).replace('.', ',')}M`;
+}
+
+// Formatea con signo: 0 → "—", positivo → "+$X,YM", negativo → "-$X,YM"
+function fmtMSigned(n) {
+  if (Math.abs(n) < 0.05) return '—';
+  return (n >= 0 ? '+' : '-') + '$' + Math.abs(n).toFixed(1).replace('.', ',') + 'M';
+}
+
+// Formatea porcentaje con signo: "+1,5%" / "-2,4%"
+function fmtPct(n) {
+  return `${n >= 0 ? '+' : ''}${n.toFixed(1).replace('.', ',')}%`;
+}
+
+// Formato compacto para celdas de proyección (sin $ ni M, sólo número con coma decimal)
+function fmtNum(n) {
+  if (n === 0) return '0';
+  return n.toFixed(0);
+}
+
+// Aplica el ICA a un detalle de UEN: agrega fila cv_ica y recalcula totales del padre cv,
+// del KPI 'COSTO DE VENTAS' y del KPI 'UTILIDAD BRUTA'. NO muta el original.
+function aplicarICA(dRaw, icaPct) {
+  const ing = dRaw.rubros.find((r) => r.id === 'ing');
+  const cv = dRaw.rubros.find((r) => r.id === 'cv');
+  if (!ing || !cv) return dRaw;
+
+  const ingPres = parseM(ing.presup);
+  const ingReal = parseM(ing.real);
+  const icaPres = (ingPres * icaPct) / 100;
+  const icaReal = (ingReal * icaPct) / 100;
+
+  const icaRow = {
+    id: 'cv_ica',
+    label: `Impuesto ICA (${String(icaPct).replace('.', ',')}% × Ingresos)`,
+    presup: fmtM(icaPres),
+    real: fmtM(icaReal),
+    devCop: fmtMSigned(icaReal - icaPres),
+    devPct: icaPres ? fmtPct(((icaReal - icaPres) / icaPres) * 100) : '0%',
+    tipo: 'gasto',
+  };
+
+  // Recalcular padre cv
+  const cvOrigPres = parseM(cv.presup);
+  const cvOrigReal = parseM(cv.real);
+  const cvNewPres = cvOrigPres + icaPres;
+  const cvNewReal = cvOrigReal + icaReal;
+  const cvNewDev = cvNewReal - cvNewPres;
+  const cvNewDevPct = cvNewPres ? (cvNewDev / cvNewPres) * 100 : 0;
+  const newCV = {
+    ...cv,
+    presup: fmtM(cvNewPres),
+    real: fmtM(cvNewReal),
+    devCop: fmtMSigned(cvNewDev),
+    devPct: fmtPct(cvNewDevPct),
+    children: [...(cv.children || []), icaRow],
+  };
+
+  // Recalcular KPI[1] (COSTO DE VENTAS) y KPI[2] (UTILIDAD BRUTA)
+  const kpiCV = dRaw.kpis[1];
+  const kpiCVPres = parseM(kpiCV.presup) + icaPres;
+  const kpiCVReal = parseM(kpiCV.real) + icaReal;
+  const kpiCVDevPct = kpiCVPres ? ((kpiCVReal - kpiCVPres) / kpiCVPres) * 100 : 0;
+
+  const ubPres = ingPres - kpiCVPres;
+  const ubReal = ingReal - kpiCVReal;
+  const ubDevPct = ubPres ? ((ubReal - ubPres) / ubPres) * 100 : 0;
+  const ubMargen = ingReal > 0 ? (ubReal / ingReal) * 100 : 0;
+
+  const newKpis = [
+    dRaw.kpis[0],
+    {
+      ...kpiCV,
+      presup: fmtM(kpiCVPres),
+      real: fmtM(kpiCVReal),
+      devPct: fmtPct(kpiCVDevPct),
+      favorable: kpiCVDevPct <= 0,
+    },
+    {
+      ...dRaw.kpis[2],
+      presup: fmtM(ubPres),
+      real: fmtM(ubReal),
+      devPct: fmtPct(ubDevPct),
+      favorable: ubDevPct >= 0,
+      extra: `${ubMargen.toFixed(1).replace('.', ',')}% margen`,
+    },
+  ];
+
+  return {
+    ...dRaw,
+    kpis: newKpis,
+    rubros: dRaw.rubros.map((r) => (r.id === 'cv' ? newCV : r)),
+  };
+}
+
 // ─── CUSTOM TOOLTIP ───────────────────────────────────────────────────────────
 
-function CustomTooltip({ active, payload, label }) {
+function CustomTooltip(props: any = {}) {
+  const { active, payload, label } = props;
   if (!active || !payload || !payload.length) return null;
   return (
     <div className="bg-white border border-slate-200 rounded-lg p-3 shadow-sm text-xs">
@@ -980,8 +1152,6 @@ function RubroRow({ row, depth = 0, expanded, toggleExpand }) {
   const isGroup = hasChildren || depth === 0;
   const indent = depth * 20;
 
-  const devNumStr = row.devPct.replace(',', '.').replace('%', '');
-  const devNum = parseFloat(devNumStr);
   const colored = tableDevColor(row.devPct, row.tipo);
 
   return (
@@ -1050,13 +1220,39 @@ function RubroRow({ row, depth = 0, expanded, toggleExpand }) {
 // ─── MAIN COMPONENT ───────────────────────────────────────────────────────────
 
 export default function GSLPresupuesto() {
-  const [view, setView] = useState('dashboard'); // "dashboard" | "uen"
+  const [view, setView] = useState('dashboard'); // "dashboard" | "uen" | "proyeccion"
   const [activeUEN, setActiveUEN] = useState('Ambiental');
   const [sidebarUENOpen, setSidebarUENOpen] = useState(true);
   const [mesIdx, setMesIdx] = useState(4); // Mayo
   const [mesDropdown, setMesDropdown] = useState(false);
   const [chartMetric, setChartMetric] = useState('Ingresos');
   const [expanded, setExpanded] = useState({ ing: true, cv: true, gd: false });
+
+  // ICA % aplicado en costos (configurable por el analista financiero)
+  const [icaPct, setIcaPct] = useState(1);
+
+  // Proyección 2027: estado en parent para no perderlo al re-render
+  const [proyUEN, setProyUEN] = useState('Oil & Gas');
+  const [proy, setProy] = useState({}); // { uen: { seccion: { rubro: number[12] } } }
+
+  // Cargar proyección desde localStorage al montar
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('gsl_proy_2027');
+      if (raw) setProy(JSON.parse(raw));
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  // Persistir en localStorage cada cambio
+  useEffect(() => {
+    try {
+      localStorage.setItem('gsl_proy_2027', JSON.stringify(proy));
+    } catch {
+      /* ignore */
+    }
+  }, [proy]);
 
   const mesLabel = `${MONTHS[mesIdx]} 2026`;
   const kpis = KPI_DATA[mesLabel] || KPI_DATA['Mayo 2026'];
@@ -1070,8 +1266,6 @@ export default function GSLPresupuesto() {
     setView('uen');
     setExpanded({ ing: true, cv: true, gd: false });
   }
-
-  const detail = UEN_DETAILS[activeUEN];
 
   // ── SIDEBAR ───────────────────────────────────────────────────────────────
 
@@ -1116,6 +1310,20 @@ export default function GSLPresupuesto() {
             <span>{uen}</span>
           </button>
         ))}
+
+      <div className="my-2 border-t border-slate-100" />
+
+      <button
+        onClick={() => setView('proyeccion')}
+        className={`flex items-center gap-2.5 mx-2 px-3 py-2 rounded-lg text-sm transition-colors ${
+          view === 'proyeccion'
+            ? 'bg-slate-900 text-white'
+            : 'text-slate-600 hover:bg-slate-100'
+        }`}
+      >
+        <LineChart size={16} strokeWidth={1.75} />
+        <span>Proyección 2027</span>
+      </button>
     </aside>
   );
 
@@ -1444,8 +1652,11 @@ export default function GSLPresupuesto() {
   // ── VIEW 2: UEN DETAIL ────────────────────────────────────────────────────
 
   const UENDetail = () => {
-    const d = UEN_DETAILS[activeUEN];
-    if (!d) return null;
+    const dRaw = UEN_DETAILS[activeUEN];
+    if (!dRaw) return null;
+
+    const isPiloto = PILOTO.includes(activeUEN);
+    const d = isPiloto ? aplicarICA(dRaw, icaPct) : dRaw;
 
     return (
       <div className="max-w-7xl mx-auto px-6 py-8 space-y-8">
@@ -1464,11 +1675,40 @@ export default function GSLPresupuesto() {
         </nav>
 
         {/* Header */}
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
-            U.E.N. {activeUEN}
-          </h1>
-          <p className="text-sm text-slate-500 mt-0.5">{d.desc}</p>
+        <div className="flex items-start justify-between gap-4 flex-wrap">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+              U.E.N. {activeUEN}
+            </h1>
+            <p className="text-sm text-slate-500 mt-0.5">{d.desc}</p>
+          </div>
+          {isPiloto && (
+            <div className="flex items-center gap-3 bg-white border border-slate-200 rounded-lg px-3 py-2">
+              <div>
+                <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
+                  ICA aplicado
+                </p>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Ajustable por jurisdicción del periodo
+                </p>
+              </div>
+              <div className="flex items-center gap-1">
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  max="20"
+                  value={icaPct}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    setIcaPct(isNaN(v) ? 0 : v);
+                  }}
+                  className="w-16 border border-slate-200 rounded-md px-2 py-1 text-sm tabular-nums text-right focus:outline-none focus:border-blue-500"
+                />
+                <span className="text-sm text-slate-600 font-medium">%</span>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* UEN Tab Switcher */}
@@ -1659,6 +1899,442 @@ export default function GSLPresupuesto() {
     );
   };
 
+  // ── VIEW 3: PROYECCIÓN 2027 ──────────────────────────────────────────────
+
+  const Proyeccion2027 = () => {
+    const tmpl = PROYECCION_TEMPLATE[proyUEN];
+
+    const getValue = (seccion, rubro, mIdx) => {
+      const v = proy[proyUEN]?.[seccion]?.[rubro]?.[mIdx];
+      return typeof v === 'number' ? v : 0;
+    };
+
+    const setValue = (seccion, rubro, mIdx, val) => {
+      setProy((prev) => {
+        const uenData = prev[proyUEN] || {};
+        const secData = uenData[seccion] || {};
+        const arr = Array.isArray(secData[rubro])
+          ? [...secData[rubro]]
+          : Array(12).fill(0);
+        arr[mIdx] = val;
+        return {
+          ...prev,
+          [proyUEN]: {
+            ...uenData,
+            [seccion]: { ...secData, [rubro]: arr },
+          },
+        };
+      });
+    };
+
+    const limpiarProyeccion = () => {
+      if (
+        confirm(
+          'Esto borrará todos los valores digitados en las 3 UEN. ¿Continuar?'
+        )
+      ) {
+        setProy({});
+        try {
+          localStorage.removeItem('gsl_proy_2027');
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+
+    // Cálculos derivados — vector de 12 meses
+    const ingresosMes = Array.from({ length: 12 }, (_, m) =>
+      tmpl.ingresos.reduce((s, r) => s + getValue('ingresos', r, m), 0)
+    );
+    const icaMes = ingresosMes.map((v) => (v * icaPct) / 100);
+
+    const costosBaseMes = Array.from({ length: 12 }, (_, m) => {
+      let s = 0;
+      Object.entries(tmpl.costos).forEach(([sec, items]) => {
+        items.forEach((r) => {
+          s += getValue(sec, r, m);
+        });
+      });
+      return s;
+    });
+    const costosMes = costosBaseMes.map((v, m) => v + icaMes[m]);
+    const utilidadMes = ingresosMes.map((v, m) => v - costosMes[m]);
+
+    const sumArr = (arr) => arr.reduce((a, b) => a + b, 0);
+
+    // Anchos de columna (uniformes)
+    const monthColW = 'w-[68px] min-w-[68px]';
+    const totalColW = 'w-[92px] min-w-[92px]';
+    const rubroColW = 'min-w-[280px] w-[280px]';
+
+    // Componente celda input
+    const InputCell = ({ seccion, rubro, mIdx }) => (
+      <td className={`${monthColW} px-1 py-0.5`}>
+        <input
+          type="number"
+          step="1"
+          min="0"
+          value={getValue(seccion, rubro, mIdx) || ''}
+          onChange={(e) => {
+            const raw = e.target.value;
+            const v = raw === '' ? 0 : parseFloat(raw);
+            setValue(seccion, rubro, mIdx, isNaN(v) ? 0 : v);
+          }}
+          placeholder="0"
+          className="w-full px-1.5 py-1 text-xs text-right tabular-nums border border-transparent hover:border-slate-200 focus:border-blue-500 focus:bg-white rounded outline-none bg-transparent"
+        />
+      </td>
+    );
+
+    // Celda de sólo lectura (totales / ICA / utilidad)
+    const ReadCell = ({ value, className = '' }) => (
+      <td
+        className={`${monthColW} px-2 py-1.5 text-right tabular-nums text-xs ${className}`}
+      >
+        {value === 0 ? '—' : fmtNum(value)}
+      </td>
+    );
+
+    return (
+      <div className="max-w-[1400px] mx-auto px-6 py-8 space-y-6">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-4 flex-wrap">
+          <div>
+            <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+              Proyección de Presupuesto 2027
+            </h1>
+            <p className="text-sm text-slate-500 mt-0.5">
+              Ingreso manual de cifras mensuales por rubro · Estructura definida
+              por la Dirección
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 bg-white border border-slate-200 rounded-lg px-3 py-2">
+              <span className="text-xs font-medium text-slate-500 uppercase tracking-wider">
+                ICA
+              </span>
+              <input
+                type="number"
+                step="0.1"
+                min="0"
+                max="20"
+                value={icaPct}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setIcaPct(isNaN(v) ? 0 : v);
+                }}
+                className="w-16 border border-slate-200 rounded-md px-2 py-1 text-sm tabular-nums text-right focus:outline-none focus:border-blue-500"
+              />
+              <span className="text-sm text-slate-600 font-medium">%</span>
+            </div>
+            <button
+              onClick={limpiarProyeccion}
+              className="border border-slate-200 bg-white hover:bg-rose-50 hover:border-rose-200 hover:text-rose-700 text-slate-700 text-sm font-medium px-3 py-2 rounded-lg transition-colors flex items-center gap-1.5"
+            >
+              <Trash2 size={14} strokeWidth={1.75} /> Limpiar
+            </button>
+          </div>
+        </div>
+
+        {/* UEN switcher */}
+        <div className="flex items-center gap-1 bg-slate-100 rounded-lg p-1 w-fit">
+          {PILOTO.map((uen) => (
+            <button
+              key={uen}
+              onClick={() => setProyUEN(uen)}
+              className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap ${
+                proyUEN === uen
+                  ? 'bg-white text-slate-900 shadow-sm'
+                  : 'text-slate-500 hover:text-slate-700'
+              }`}
+            >
+              {uen}
+            </button>
+          ))}
+        </div>
+
+        {/* Tabla de proyección */}
+        <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+          <div className="p-5 pb-3 border-b border-slate-100">
+            <h2 className="text-base font-semibold text-slate-900">
+              {proyUEN} · Año 2027
+            </h2>
+            <p className="text-xs text-slate-500 mt-0.5">
+              Cifras en millones de pesos. Las celdas grises se calculan
+              automáticamente.
+            </p>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse">
+              <thead className="bg-slate-50 border-b border-slate-200">
+                <tr>
+                  <th
+                    className={`${rubroColW} text-left text-xs font-medium uppercase tracking-wider text-slate-500 py-2.5 px-4 sticky left-0 bg-slate-50 z-10`}
+                  >
+                    Rubro
+                  </th>
+                  {MESES_CORTOS.map((m) => (
+                    <th
+                      key={m}
+                      className={`${monthColW} text-center text-xs font-medium uppercase tracking-wider text-slate-500 py-2.5 px-1`}
+                    >
+                      {m}
+                    </th>
+                  ))}
+                  <th
+                    className={`${totalColW} text-right text-xs font-medium uppercase tracking-wider text-slate-500 py-2.5 px-3`}
+                  >
+                    Total
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {/* ─── INGRESOS ─── */}
+                <tr className="bg-blue-50/50 border-b border-slate-200">
+                  <td
+                    className={`${rubroColW} py-2 px-4 text-sm font-semibold text-slate-800 sticky left-0 bg-blue-50/50 z-10`}
+                  >
+                    INGRESOS
+                  </td>
+                  {ingresosMes.map((v, m) => (
+                    <ReadCell
+                      key={m}
+                      value={v}
+                      className="font-semibold text-slate-800"
+                    />
+                  ))}
+                  <td
+                    className={`${totalColW} px-3 py-2 text-right tabular-nums text-sm font-bold text-slate-900`}
+                  >
+                    {sumArr(ingresosMes) === 0
+                      ? '—'
+                      : fmtNum(sumArr(ingresosMes))}
+                  </td>
+                </tr>
+                {tmpl.ingresos.map((rubro) => {
+                  const rowVals = Array.from({ length: 12 }, (_, m) =>
+                    getValue('ingresos', rubro, m)
+                  );
+                  return (
+                    <tr
+                      key={rubro}
+                      className="border-b border-slate-100 hover:bg-slate-50/40"
+                    >
+                      <td
+                        className={`${rubroColW} py-1 px-4 pl-8 text-sm text-slate-600 sticky left-0 bg-white z-10`}
+                      >
+                        {rubro}
+                      </td>
+                      {Array.from({ length: 12 }, (_, m) => (
+                        <InputCell
+                          key={m}
+                          seccion="ingresos"
+                          rubro={rubro}
+                          mIdx={m}
+                        />
+                      ))}
+                      <td
+                        className={`${totalColW} px-3 py-1 text-right tabular-nums text-xs font-semibold text-slate-700`}
+                      >
+                        {sumArr(rowVals) === 0 ? '—' : fmtNum(sumArr(rowVals))}
+                      </td>
+                    </tr>
+                  );
+                })}
+
+                {/* ─── COSTOS ─── */}
+                <tr className="bg-rose-50/40 border-b border-slate-200 border-t-2 border-t-slate-200">
+                  <td
+                    className={`${rubroColW} py-2 px-4 text-sm font-semibold text-slate-800 sticky left-0 bg-rose-50/40 z-10`}
+                  >
+                    COSTOS
+                  </td>
+                  {costosMes.map((v, m) => (
+                    <ReadCell
+                      key={m}
+                      value={v}
+                      className="font-semibold text-slate-800"
+                    />
+                  ))}
+                  <td
+                    className={`${totalColW} px-3 py-2 text-right tabular-nums text-sm font-bold text-slate-900`}
+                  >
+                    {sumArr(costosMes) === 0
+                      ? '—'
+                      : fmtNum(sumArr(costosMes))}
+                  </td>
+                </tr>
+
+                {/* Sub-secciones de costos */}
+                {Object.entries(tmpl.costos).map(([seccion, items]) => {
+                  const subMes = Array.from({ length: 12 }, (_, m) =>
+                    items.reduce((s, r) => s + getValue(seccion, r, m), 0)
+                  );
+                  return (
+                    <Fragment key={`sub-${seccion}`}>
+                      <tr className="bg-slate-50 border-b border-slate-100">
+                        <td
+                          className={`${rubroColW} py-1.5 px-4 pl-6 text-xs font-semibold uppercase tracking-wider text-slate-600 sticky left-0 bg-slate-50 z-10`}
+                        >
+                          {seccion}
+                        </td>
+                        {subMes.map((v, m) => (
+                          <ReadCell
+                            key={m}
+                            value={v}
+                            className="text-slate-600 font-medium"
+                          />
+                        ))}
+                        <td
+                          className={`${totalColW} px-3 py-1.5 text-right tabular-nums text-xs font-semibold text-slate-700`}
+                        >
+                          {sumArr(subMes) === 0 ? '—' : fmtNum(sumArr(subMes))}
+                        </td>
+                      </tr>
+                      {items.map((rubro) => {
+                        const rowVals = Array.from({ length: 12 }, (_, m) =>
+                          getValue(seccion, rubro, m)
+                        );
+                        return (
+                          <tr
+                            key={`${seccion}-${rubro}`}
+                            className="border-b border-slate-100 hover:bg-slate-50/40"
+                          >
+                            <td
+                              className={`${rubroColW} py-1 px-4 pl-10 text-sm text-slate-600 sticky left-0 bg-white z-10`}
+                            >
+                              {rubro}
+                            </td>
+                            {Array.from({ length: 12 }, (_, m) => (
+                              <InputCell
+                                key={m}
+                                seccion={seccion}
+                                rubro={rubro}
+                                mIdx={m}
+                              />
+                            ))}
+                            <td
+                              className={`${totalColW} px-3 py-1 text-right tabular-nums text-xs font-semibold text-slate-700`}
+                            >
+                              {sumArr(rowVals) === 0
+                                ? '—'
+                                : fmtNum(sumArr(rowVals))}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </Fragment>
+                  );
+                })}
+
+                {/* ICA — fila auto-calculada */}
+                <tr className="bg-amber-50/40 border-b border-slate-200">
+                  <td
+                    className={`${rubroColW} py-1.5 px-4 pl-6 text-sm text-slate-700 italic sticky left-0 bg-amber-50/40 z-10`}
+                  >
+                    Impuesto ICA ({String(icaPct).replace('.', ',')}% × Ingresos)
+                  </td>
+                  {icaMes.map((v, m) => (
+                    <ReadCell
+                      key={m}
+                      value={v}
+                      className="text-amber-700 font-medium"
+                    />
+                  ))}
+                  <td
+                    className={`${totalColW} px-3 py-1.5 text-right tabular-nums text-xs font-semibold text-amber-700`}
+                  >
+                    {sumArr(icaMes) === 0 ? '—' : fmtNum(sumArr(icaMes))}
+                  </td>
+                </tr>
+
+                {/* ─── UTILIDAD BRUTA ─── */}
+                <tr className="bg-emerald-50/60 border-t-2 border-slate-300">
+                  <td
+                    className={`${rubroColW} py-2.5 px-4 text-sm font-bold text-slate-900 sticky left-0 bg-emerald-50/60 z-10`}
+                  >
+                    UTILIDAD BRUTA
+                  </td>
+                  {utilidadMes.map((v, m) => (
+                    <td
+                      key={m}
+                      className={`${monthColW} px-2 py-2.5 text-right tabular-nums text-xs font-bold ${
+                        v >= 0 ? 'text-emerald-700' : 'text-rose-700'
+                      }`}
+                    >
+                      {v === 0 ? '—' : fmtNum(v)}
+                    </td>
+                  ))}
+                  <td
+                    className={`${totalColW} px-3 py-2.5 text-right tabular-nums text-sm font-bold ${
+                      sumArr(utilidadMes) >= 0
+                        ? 'text-emerald-700'
+                        : 'text-rose-700'
+                    }`}
+                  >
+                    {sumArr(utilidadMes) === 0
+                      ? '—'
+                      : fmtNum(sumArr(utilidadMes))}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Resumen anual */}
+        <div className="grid grid-cols-3 gap-4">
+          <div className="bg-white rounded-xl border border-slate-200 p-5">
+            <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
+              Ingresos Anuales 2027
+            </p>
+            <p className="text-2xl font-semibold tabular-nums text-slate-900 mt-2">
+              {sumArr(ingresosMes) === 0 ? '—' : `$${fmtNum(sumArr(ingresosMes))}M`}
+            </p>
+            <p className="text-xs text-slate-400 mt-1">
+              Suma de los 12 meses · {proyUEN}
+            </p>
+          </div>
+          <div className="bg-white rounded-xl border border-slate-200 p-5">
+            <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
+              Costos Anuales 2027
+            </p>
+            <p className="text-2xl font-semibold tabular-nums text-slate-900 mt-2">
+              {sumArr(costosMes) === 0 ? '—' : `$${fmtNum(sumArr(costosMes))}M`}
+            </p>
+            <p className="text-xs text-slate-400 mt-1">
+              Incluye ICA del {String(icaPct).replace('.', ',')}%
+            </p>
+          </div>
+          <div className="bg-white rounded-xl border border-slate-200 p-5">
+            <p className="text-xs font-medium uppercase tracking-wider text-slate-500">
+              Utilidad Bruta Proyectada
+            </p>
+            <p
+              className={`text-2xl font-semibold tabular-nums mt-2 ${
+                sumArr(utilidadMes) >= 0 ? 'text-emerald-700' : 'text-rose-700'
+              }`}
+            >
+              {sumArr(utilidadMes) === 0
+                ? '—'
+                : `$${fmtNum(sumArr(utilidadMes))}M`}
+            </p>
+            <p className="text-xs text-slate-400 mt-1">
+              {sumArr(ingresosMes) > 0
+                ? `${(
+                    (sumArr(utilidadMes) / sumArr(ingresosMes)) *
+                    100
+                  )
+                    .toFixed(1)
+                    .replace('.', ',')}% margen`
+                : 'Sin datos digitados aún'}
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   // ── SHELL ──────────────────────────────────────────────────────────────────
 
   return (
@@ -1667,7 +2343,9 @@ export default function GSLPresupuesto() {
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
         <main className="flex-1 overflow-y-auto">
-          {view === 'dashboard' ? <Dashboard /> : <UENDetail />}
+          {view === 'dashboard' && <Dashboard />}
+          {view === 'uen' && <UENDetail />}
+          {view === 'proyeccion' && <Proyeccion2027 />}
         </main>
       </div>
     </div>
